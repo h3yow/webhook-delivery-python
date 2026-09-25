@@ -28,6 +28,7 @@ def _to_out(rec: EventRecord) -> EventOut:
 
 def create_app(db_path: str = ":memory:", deliver_url: str = "http://127.0.0.1:9/recv",
                policy: RetryPolicy | None = None,
+               timeout: float = 2.0,
                receiver_app: FastAPI | None = None) -> FastAPI:
     """创建主应用。
 
@@ -36,7 +37,7 @@ def create_app(db_path: str = ":memory:", deliver_url: str = "http://127.0.0.1:9
     - receiver_app: 为 None 时挂载内置模拟接收端到 /_receiver。
     """
     store = EventStore(db_path)
-    dispatcher = Dispatcher(store, deliver_url, policy=policy)
+    dispatcher = Dispatcher(store, deliver_url, policy=policy, timeout=timeout)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

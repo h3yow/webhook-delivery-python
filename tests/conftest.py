@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import itertools
 import logging
 import socket
 import time
@@ -48,8 +49,7 @@ class ReceiverHandle:
         return r.json()["deliveries"]
 
 
-@pytest.fixture
-async def receiver() -> AsyncIterator[ReceiverHandle]:
+async def start_receiver() -> ReceiverHandle:
     """启动一个真实 HTTP 模拟接收端（独立端口）。"""
     port = _free_port()
     config = uvicorn.Config(create_receiver_app(), host="127.0.0.1",
@@ -59,16 +59,40 @@ async def receiver() -> AsyncIterator[ReceiverHandle]:
     while not server.started:
         await asyncio.sleep(0.01)
     url = f"http://127.0.0.1:{port}"
-    async with httpx.AsyncClient(base_url=url) as client:
-        yield ReceiverHandle(url=url, client=client, server=server, task=task)
-    server.should_exit = True
-    await task
+    client = httpx.AsyncClient(base_url=url)
+    return ReceiverHandle(url=url, client=client, server=server, task=task)
+
+
+async def stop_receiver(h: ReceiverHandle) -> None:
+    await h.client.aclose()
+    h.server.should_exit = True
+    await h.task
+
+
+@pytest.fixture
+async def receiver_factory():
+    handles: list[ReceiverHandle] = []
+
+    async def factory() -> ReceiverHandle:
+        h = await start_receiver()
+        handles.append(h)
+        return h
+
+    yield factory
+    for h in handles:
+        await stop_receiver(h)
+
+
+@pytest.fixture
+async def receiver(receiver_factory) -> ReceiverHandle:
+    return await receiver_factory()
 
 
 @dataclass
 class ServiceHandle:
     client: httpx.AsyncClient
     db_path: str
+    app: object
 
     async def submit(self, **event) -> httpx.Response:
         return await self.client.post("/events", json=event)
@@ -91,15 +115,36 @@ def make_service_params(tmp_path, deliver_url: str, **overrides) -> dict:
 
 
 @pytest.fixture
-async def service(tmp_path, receiver) -> AsyncIterator[ServiceHandle]:
-    """被测服务：文件型 SQLite + 指向模拟接收端的调度器。"""
-    params = make_service_params(tmp_path, f"{receiver.url}/recv")
-    app = create_app(**params)
-    async with app.router.lifespan_context(app):
+async def service_factory(tmp_path):
+    """服务工厂：可自定义 deliver_url / timeout / max_attempts 等。"""
+    stacks: list = []
+    counter = itertools.count()
+
+    async def factory(**overrides) -> ServiceHandle:
+        params = make_service_params(tmp_path, overrides.pop("deliver_url"),
+                                     **overrides)
+        params["db_path"] = str(
+            tmp_path / f"events-{next(counter)}.db")  # 每实例独立 db
+        app = create_app(**params)
+        cm = app.router.lifespan_context(app)
+        await cm.__aenter__()
+        stacks.append(cm)
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport,
-                                     base_url="http://svc") as client:
-            yield ServiceHandle(client=client, db_path=params["db_path"])
+        client = httpx.AsyncClient(transport=transport, base_url="http://svc")
+        stacks.append(client)
+        return ServiceHandle(client=client, db_path=params["db_path"], app=app)
+
+    yield factory
+    for cm in reversed(stacks):
+        if isinstance(cm, httpx.AsyncClient):
+            await cm.aclose()
+        else:
+            await cm.__aexit__(None, None, None)
+
+
+@pytest.fixture
+async def service(service_factory, receiver) -> ServiceHandle:
+    return await service_factory(deliver_url=f"{receiver.url}/recv")
 
 
 async def wait_for(predicate, timeout: float = 5.0, interval: float = 0.02):
