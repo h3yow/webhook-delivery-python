@@ -6,7 +6,8 @@ import sqlite3
 import threading
 import time
 
-from .models import AttemptOut, EventRecord, EventStatus, FailureKind
+from .models import (AttemptOut, EventRecord, EventStatus, FailureKind,
+                     TargetRecord)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -24,11 +25,32 @@ CREATE TABLE IF NOT EXISTS events (
     updated_at REAL NOT NULL,
     history TEXT NOT NULL DEFAULT '[]'
 );
+CREATE TABLE IF NOT EXISTS targets (
+    name TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
 class DuplicateEventError(Exception):
     """幂等标识冲突：同一 event_id 已存在。"""
+
+
+class DuplicateTargetError(Exception):
+    """目标名冲突：同名目标已登记。"""
+
+
+def _row_to_target(row: sqlite3.Row) -> TargetRecord:
+    return TargetRecord(
+        name=row["name"],
+        url=row["url"],
+        enabled=bool(row["enabled"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
 
 
 def _row_to_record(row: sqlite3.Row) -> EventRecord:
@@ -105,16 +127,26 @@ class EventStore:
             ).fetchall()
         return [_row_to_record(r) for r in rows]
 
-    def claim_due(self, now: float, limit: int) -> list[EventRecord]:
-        """原子认领到期事件：pending 且到期 -> in_flight，返回被认领记录。"""
+    def claim_due(self, now: float, limit: int,
+                  allow_unknown_target: bool = True) -> list[EventRecord]:
+        """原子认领到期事件：pending 且到期 -> in_flight，返回被认领记录。
+
+        只认领路由目标当前可投的事件：目标已登记但停用的留在 pending，
+        等重新启用后再投；未登记的名字由 allow_unknown_target 决定是否放行
+        （兼容固定 deliver_url 的旧模式）。
+        """
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 rows = self._conn.execute(
-                    "SELECT * FROM events WHERE status = ?"
-                    " AND (next_retry_at IS NULL OR next_retry_at <= ?)"
-                    " ORDER BY created_at, event_id LIMIT ?",
-                    (EventStatus.PENDING.value, now, limit),
+                    "SELECT e.* FROM events e"
+                    " LEFT JOIN targets t ON t.name = e.receiver"
+                    " WHERE e.status = ?"
+                    " AND (e.next_retry_at IS NULL OR e.next_retry_at <= ?)"
+                    " AND (t.enabled = 1 OR (t.name IS NULL AND ?))"
+                    " ORDER BY e.created_at, e.event_id LIMIT ?",
+                    (EventStatus.PENDING.value, now,
+                     1 if allow_unknown_target else 0, limit),
                 ).fetchall()
                 ids = [r["event_id"] for r in rows]
                 if ids:
@@ -184,3 +216,64 @@ class EventStore:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # ---- 投递目标登记 ----
+
+    def insert_target(self, record: TargetRecord) -> None:
+        now = time.time()
+        record.created_at = record.created_at or now
+        record.updated_at = now
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO targets (name, url, enabled, created_at,"
+                    " updated_at) VALUES (?,?,?,?,?)",
+                    (record.name, record.url, int(record.enabled),
+                     record.created_at, record.updated_at),
+                )
+                self._conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateTargetError(record.name) from exc
+
+    def get_target(self, name: str) -> TargetRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM targets WHERE name = ?", (name,)
+            ).fetchone()
+        return _row_to_target(row) if row else None
+
+    def list_targets(self) -> list[TargetRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM targets ORDER BY created_at, name"
+            ).fetchall()
+        return [_row_to_target(r) for r in rows]
+
+    def update_target(self, name: str, url: str | None = None,
+                      enabled: bool | None = None) -> TargetRecord | None:
+        """部分更新目标地址/启用状态；目标不存在返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM targets WHERE name = ?", (name,)
+            ).fetchone()
+            if row is None:
+                return None
+            new_url = url if url is not None else row["url"]
+            new_enabled = (int(enabled) if enabled is not None
+                           else row["enabled"])
+            self._conn.execute(
+                "UPDATE targets SET url=?, enabled=?, updated_at=?"
+                " WHERE name=?",
+                (new_url, new_enabled, time.time(), name),
+            )
+            self._conn.commit()
+        return self.get_target(name)
+
+    def count_pending(self) -> int:
+        """待投递事件数（pending + in_flight），用于容量上限判定。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE status IN (?, ?)",
+                (EventStatus.PENDING.value, EventStatus.IN_FLIGHT.value),
+            ).fetchone()
+        return int(row["n"])

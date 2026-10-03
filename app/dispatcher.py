@@ -35,11 +35,13 @@ class Dispatcher:
     """后台投递循环。
 
     - 每次投递有独立超时，超时判定为失败，且单个慢接收端不阻塞其他接收端；
-    - 同一接收端的事件严格按序投递（per-receiver 锁），不同接收端并发；
+    - 同一接收端（目标）的事件严格按序投递（per-receiver 锁），不同目标并发；
+    - 每个事件按 receiver 名字路由到已登记目标的地址；未登记的名字回落到
+      deliver_url（兼容固定地址模式；为 None 时未登记名字在提交期已被拒绝）；
     - 全局信号量限制并发投递数，避免资源无界增长。
     """
 
-    def __init__(self, store: EventStore, deliver_url: str,
+    def __init__(self, store: EventStore, deliver_url: str | None,
                  policy: RetryPolicy | None = None,
                  timeout: float = 2.0,
                  concurrency: int = 4,
@@ -86,7 +88,9 @@ class Dispatcher:
     async def _loop(self) -> None:
         while not self._stopping:
             try:
-                due = self._store.claim_due(time.time(), self._batch_size)
+                due = self._store.claim_due(
+                    time.time(), self._batch_size,
+                    allow_unknown_target=self._deliver_url is not None)
             except Exception:
                 logger.exception("claim_due failed")
                 due = []
@@ -120,15 +124,33 @@ class Dispatcher:
                 async with self._semaphore:
                     await self._deliver_one(rec)
 
+    def resolve_url(self, receiver: str) -> str | None:
+        """按接收端名字解析投递地址：已登记目标优先，否则回落默认地址。"""
+        target = self._store.get_target(receiver)
+        if target is not None:
+            return target.url if target.enabled else None
+        return self._deliver_url
+
     async def _deliver_one(self, rec: EventRecord) -> None:
         attempt = rec.attempts + 1
+        url = self.resolve_url(rec.receiver)
+        if url is None:
+            # 目标在认领后被停用，或无路由可用：退回 pending 等待恢复，
+            # 不消耗重试次数、不判失败
+            self._store.reschedule(rec.event_id, FailureKind.NONE,
+                                   "no route: target disabled or missing",
+                                   rec.attempts, time.time() + self._poll_interval * 10,
+                                   time.time())
+            logger.info("event=%s receiver=%s result=deferred (no route)",
+                        rec.event_id, rec.receiver)
+            return
         now = time.time()
         exc: BaseException | None = None
         status_code: int | None = None
         body: bytes | None = None
         try:
             resp = await self._client.post(
-                self._deliver_url,
+                url,
                 json={
                     "event_id": rec.event_id,
                     "event_type": rec.event_type,

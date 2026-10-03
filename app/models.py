@@ -40,6 +40,41 @@ RETRIABLE_KINDS: frozenset[FailureKind] = frozenset(
 )
 
 
+class TargetIn(BaseModel):
+    """投递目标注册请求体。"""
+
+    name: str = Field(min_length=1, max_length=128)
+    url: str = Field(min_length=1, max_length=512)
+
+
+class TargetPatch(BaseModel):
+    """投递目标更新请求体（部分更新）。"""
+
+    url: str | None = Field(default=None, min_length=1, max_length=512)
+    enabled: bool | None = None
+
+
+class TargetOut(BaseModel):
+    """投递目标查询响应。"""
+
+    name: str
+    url: str
+    enabled: bool
+    created_at: float
+    updated_at: float
+
+
+@dataclass
+class TargetRecord:
+    """持久化的投递目标记录。"""
+
+    name: str
+    url: str
+    enabled: bool = True
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
 class EventIn(BaseModel):
     """事件提交请求体。"""
 
@@ -78,6 +113,7 @@ class EventOut(BaseModel):
     last_failure_kind: FailureKind
     last_failure_detail: str
     next_retry_at: float | None
+    target_url: str | None = None  # 该事件路由到的目标地址（未登记走默认时为 None）
     history: list[AttemptOut] = Field(default_factory=list)
 
 
