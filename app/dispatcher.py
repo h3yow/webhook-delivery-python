@@ -39,14 +39,19 @@ class Dispatcher:
     - 全局信号量限制并发投递数，避免资源无界增长。
     """
 
-    def __init__(self, store: EventStore, deliver_url: str,
+    def __init__(self, store: EventStore, deliver_url: str | None = None,
                  policy: RetryPolicy | None = None,
                  timeout: float = 2.0,
                  concurrency: int = 4,
                  poll_interval: float = 0.05,
-                 batch_size: int = 32) -> None:
+                 batch_size: int = 32,
+                 routed: bool = False,
+                 defer_interval: float = 1.0) -> None:
         self._store = store
+        # 旧装配（单固定地址）：deliver_url 兜底；路由装配：地址按 receiver 名解析
         self._deliver_url = deliver_url
+        self._routed = routed
+        self._defer_interval = defer_interval
         self._policy = policy or RetryPolicy()
         self._timeout = timeout
         self._concurrency = concurrency
@@ -57,6 +62,7 @@ class Dispatcher:
         self._workers: set[asyncio.Task] = set()
         self._receiver_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._semaphore: asyncio.Semaphore | None = None
+        self._wake: asyncio.Event | None = None
         self._stopping = False
 
     async def start(self) -> None:
@@ -66,6 +72,7 @@ class Dispatcher:
             logger.warning("recovered %d in-flight events after restart", recovered)
         self._client = httpx.AsyncClient(timeout=self._timeout)
         self._semaphore = asyncio.Semaphore(self._concurrency)
+        self._wake = asyncio.Event()
         self._stopping = False
         self._loop_task = asyncio.create_task(self._loop(), name="dispatch-loop")
 
@@ -85,8 +92,12 @@ class Dispatcher:
 
     async def _loop(self) -> None:
         while not self._stopping:
+            # 认领前先清唤醒位：认领/投递期间到达的 notify 不会被误清，
+            # 下一轮等待立即返回，保证多目标事件被及时认领。
+            self._wake.clear()
             try:
-                due = self._store.claim_due(time.time(), self._batch_size)
+                due = self._store.claim_due(time.time(), self._batch_size,
+                                            routed=self._routed)
             except Exception:
                 logger.exception("claim_due failed")
                 due = []
@@ -95,7 +106,21 @@ class Dispatcher:
                 by_receiver[rec.receiver].append(rec)
             for receiver, records in by_receiver.items():
                 self._spawn_worker(receiver, records)
-            await asyncio.sleep(self._poll_interval)
+            # 有认领说明可能还有队首事件，立即再认领一轮；否则等待唤醒或轮询
+            if due:
+                await asyncio.sleep(0)
+                continue
+            try:
+                await asyncio.wait_for(self._wake.wait(),
+                                       timeout=self._poll_interval)
+            except asyncio.TimeoutError:
+                pass
+
+    def notify(self) -> None:
+        """有新事件/目标状态变化时唤醒调度循环，缩短认领延迟。"""
+        wake = getattr(self, "_wake", None)
+        if wake is not None:
+            wake.set()
 
     def _spawn_worker(self, receiver: str, records: list[EventRecord]) -> None:
         task = asyncio.create_task(
@@ -107,20 +132,33 @@ class Dispatcher:
 
     async def _deliver_sequential(self, receiver: str,
                                   records: list[EventRecord]) -> None:
-        """同一接收端串行投递，保证顺序约束。"""
+        """同一接收端（目标）串行投递，保证顺序约束。"""
         lock = self._receiver_locks[receiver]
         async with lock:
             for rec in records:
                 if self._stopping:
                     # 停止时把未处理事件退回 pending，等待下次恢复
-                    self._store.reschedule(
-                        rec.event_id, FailureKind.NONE, "dispatcher stopped",
-                        rec.attempts, time.time(), time.time())
+                    self._store.defer(rec.event_id, time.time(), time.time())
                     continue
+                url: str | None = self._deliver_url
+                if self._routed:
+                    target = self._store.get_target(rec.receiver)
+                    # 认领后目标可能刚被停用/删除：不算失败，延后再投
+                    if target is None or not target.enabled:
+                        self._store.defer(
+                            rec.event_id,
+                            time.time() + self._defer_interval, time.time())
+                        logger.info(
+                            "event=%s target=%s result=deferred -> 目标停用/未登记",
+                            rec.event_id, rec.receiver)
+                        continue
+                    url = target.url
                 async with self._semaphore:
-                    await self._deliver_one(rec)
+                    await self._deliver_one(rec, url)
+                if not self._stopping:
+                    self.notify()  # 队首可能已推进，唤醒立即认领下一条
 
-    async def _deliver_one(self, rec: EventRecord) -> None:
+    async def _deliver_one(self, rec: EventRecord, url: str) -> None:
         attempt = rec.attempts + 1
         now = time.time()
         exc: BaseException | None = None
@@ -128,11 +166,12 @@ class Dispatcher:
         body: bytes | None = None
         try:
             resp = await self._client.post(
-                self._deliver_url,
+                url,
                 json={
                     "event_id": rec.event_id,
                     "event_type": rec.event_type,
                     "receiver": rec.receiver,
+                    "target": rec.receiver,
                     "payload": rec.payload,
                     "attempt": attempt,
                 },
@@ -146,8 +185,8 @@ class Dispatcher:
             self._store.complete(rec.event_id, EventStatus.DELIVERED,
                                  FailureKind.NONE, f"http {status_code}",
                                  attempt, time.time())
-            logger.info("event=%s attempt=%d result=delivered http=%d",
-                        rec.event_id, attempt, status_code)
+            logger.info("event=%s target=%s attempt=%d result=delivered http=%d",
+                        rec.event_id, rec.receiver, attempt, status_code)
             return
 
         kind = self.classify(exc, status_code, body)
@@ -163,8 +202,9 @@ class Dispatcher:
                                  detail, attempt, time.time())
             decision = ("give up: attempts exhausted" if retriable
                         else "give up: non-retriable failure")
-        logger.info("event=%s attempt=%d result=failed kind=%s detail=%r -> %s",
-                    rec.event_id, attempt, kind.value, detail, decision)
+        logger.info("event=%s target=%s attempt=%d result=failed kind=%s "
+                    "detail=%r -> %s", rec.event_id, rec.receiver, attempt,
+                    kind.value, detail, decision)
 
     def classify(self, exc: BaseException | None, status_code: int | None,
                  body: bytes | None) -> FailureKind:

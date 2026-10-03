@@ -102,8 +102,18 @@ class ServiceHandle:
         assert r.status_code == 200, r.text
         return r.json()
 
+    async def register(self, name: str, url: str) -> httpx.Response:
+        return await self.client.put(f"/targets/{name}", json={"url": url})
 
-def make_service_params(tmp_path, deliver_url: str, **overrides) -> dict:
+    async def set_enabled(self, name: str, enabled: bool) -> httpx.Response:
+        return await self.client.patch(f"/targets/{name}",
+                                       json={"enabled": enabled})
+
+    async def targets(self) -> list[dict]:
+        return (await self.client.get("/targets")).json()
+
+
+def make_service_params(tmp_path, deliver_url: str | None, **overrides) -> dict:
     policy = RetryPolicy(base_delay=0.05, factor=2.0, max_delay=0.5,
                          max_attempts=overrides.pop("max_attempts", 4))
     return {
@@ -116,13 +126,17 @@ def make_service_params(tmp_path, deliver_url: str, **overrides) -> dict:
 
 @pytest.fixture
 async def service_factory(tmp_path):
-    """服务工厂：可自定义 deliver_url / timeout / max_attempts 等。"""
+    """服务工厂。
+
+    - 传 deliver_url：固定地址模式（旧语义，兼容旧用例）；
+    - 传 targets={name: url}：路由模式，按事件 receiver 名字选目标。
+    """
     stacks: list = []
     counter = itertools.count()
 
     async def factory(**overrides) -> ServiceHandle:
-        params = make_service_params(tmp_path, overrides.pop("deliver_url"),
-                                     **overrides)
+        deliver_url = overrides.pop("deliver_url", None)
+        params = make_service_params(tmp_path, deliver_url, **overrides)
         params["db_path"] = str(
             tmp_path / f"events-{next(counter)}.db")  # 每实例独立 db
         app = create_app(**params)
@@ -145,6 +159,19 @@ async def service_factory(tmp_path):
 @pytest.fixture
 async def service(service_factory, receiver) -> ServiceHandle:
     return await service_factory(deliver_url=f"{receiver.url}/recv")
+
+
+@pytest.fixture
+async def routed_service(service_factory, receiver_factory) -> ServiceHandle:
+    """路由模式服务：预置两个具名目标 ta/tb，分别指向两个本地接收端。"""
+    ra = await receiver_factory()
+    rb = await receiver_factory()
+    svc = await service_factory(targets={
+        "ta": f"{ra.url}/recv",
+        "tb": f"{rb.url}/recv",
+    })
+    svc.receivers = {"ta": ra, "tb": rb}
+    return svc
 
 
 async def wait_for(predicate, timeout: float = 5.0, interval: float = 0.02):

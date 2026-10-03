@@ -49,6 +49,29 @@ class EventIn(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class TargetIn(BaseModel):
+    """投递目标注册请求体。"""
+
+    url: str = Field(min_length=1, max_length=2048)
+
+
+class TargetUpdate(BaseModel):
+    """投递目标更新请求体；目前仅允许停用/重新启用。"""
+
+    enabled: bool
+
+
+class TargetOut(BaseModel):
+    """投递目标查询/登记响应。"""
+
+    name: str
+    url: str
+    enabled: bool
+    created_at: float
+    updated_at: float
+    duplicated: bool = False
+
+
 class EventAccepted(BaseModel):
     """事件受理响应。"""
 
@@ -72,6 +95,7 @@ class EventOut(BaseModel):
     event_id: str
     event_type: str
     receiver: str
+    target: str | None = None
     status: EventStatus
     attempts: int
     max_attempts: int
@@ -79,6 +103,18 @@ class EventOut(BaseModel):
     last_failure_detail: str
     next_retry_at: float | None
     history: list[AttemptOut] = Field(default_factory=list)
+
+
+@dataclass
+class TargetRecord:
+    """持久化的投递目标记录。名字即路由键，名字与地址一一对应、不可改址。"""
+
+    name: str
+    url: str
+    enabled: bool = True
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    duplicated: bool = False
 
 
 @dataclass
